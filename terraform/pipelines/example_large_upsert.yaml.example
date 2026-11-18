@@ -1,0 +1,26 @@
+# Template for a LARGE daily upsert (~10 GB/day). Rename to <name>.yaml to activate.
+# engine: glue  -> Spark MERGE (no 30-min limit). The day's files are the view `src`;
+# the target is addressed as glue_catalog.<db>.<table>. Spark SQL syntax.
+engine: glue
+target_table: ${db}.big_events
+
+source:
+  table: ${db}.raw_big_events_daily   # Athena table over the landing prefix (used by the quality gate only)
+  partition_column: dt
+  s3_prefix: raw/big_events_daily/dt={{dt}}/
+  format: parquet                     # strongly preferred over csv at this size
+  ready_marker: _SUCCESS              # upstream writes this LAST; its arrival starts the load (event-driven)
+
+checks:
+  min_rows: 1
+  key_columns: [event_id]
+  not_null: [event_id, event_ts]
+
+merge_sql: |
+  MERGE INTO glue_catalog.${db}.big_events t
+  USING (SELECT * FROM src) s
+  ON t.event_id = s.event_id
+  -- If updates only ever touch recent data, add e.g.  AND t.event_date >= date_sub(to_date('{{dt}}'), 60)
+  -- so Spark only rewrites recent partitions instead of scanning the whole table.
+  WHEN MATCHED THEN UPDATE SET *
+  WHEN NOT MATCHED THEN INSERT *

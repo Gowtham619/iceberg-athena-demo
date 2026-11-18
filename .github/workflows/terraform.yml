@@ -1,0 +1,103 @@
+name: terraform
+
+on:
+  pull_request:
+    paths: ["terraform/**", "bootstrap/**", "tests/**", ".github/workflows/**"]
+  push:
+    branches: [main]
+    paths: ["terraform/**", "tests/**"]
+
+permissions:
+  id-token: write   # OIDC to AWS
+  contents: read
+  pull-requests: write
+
+env:
+  TF_VERSION: "1.10.5"
+  TF_IN_AUTOMATION: "true"
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install boto3 pytest && pytest -q tests
+      - uses: hashicorp/setup-terraform@v3
+        with: { terraform_version: "${{ env.TF_VERSION }}" }
+      - run: terraform fmt -check -recursive
+      - name: validate (no backend)
+        working-directory: terraform
+        run: terraform init -backend=false -input=false && terraform validate
+      - uses: terraform-linters/setup-tflint@v4
+      - name: tflint
+        working-directory: terraform
+        run: tflint --init && tflint --config ../.tflint.hcl
+      - name: security scan (checkov)
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: terraform
+          framework: terraform
+          soft_fail: false
+          # Accepted for this stack (documented in docs/RUNBOOK.md): no VPC for Lambda/Glue (they only call AWS APIs),
+          # no cross-region replication, no S3 event notifications, SNS/KMS wildcard conditions.
+          skip_check: CKV_AWS_117,CKV_AWS_144,CKV2_AWS_62,CKV_AWS_116,CKV_AWS_173,CKV_AWS_272,CKV_AWS_18,CKV2_AWS_61,CKV2_AWS_6,CKV_AWS_300,CKV_AWS_109,CKV_AWS_111,CKV_AWS_356
+
+  plan:
+    if: github.event_name == 'pull_request'
+    needs: checks
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        env: [dev, prod]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-arn: ${{ matrix.env == 'prod' && vars.AWS_PLAN_ROLE_ARN_PROD || vars.AWS_PLAN_ROLE_ARN_DEV }}
+          aws-region: us-east-1
+      - uses: hashicorp/setup-terraform@v3
+        with: { terraform_version: "${{ env.TF_VERSION }}" }
+      - name: plan
+        working-directory: terraform
+        run: |
+          terraform init -input=false -backend-config=envs/${{ matrix.env }}.backend.hcl
+          terraform plan -input=false -lock-timeout=5m -var-file=envs/${{ matrix.env }}.tfvars -no-color | tee plan.txt
+          { echo "### terraform plan (${{ matrix.env }})"; echo '```'; tail -n 60 plan.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+  apply-dev:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: checks
+    runs-on: ubuntu-latest
+    environment: dev
+    concurrency: { group: tf-dev, cancel-in-progress: false }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with: { role-to-arn: "${{ vars.AWS_APPLY_ROLE_ARN }}", aws-region: us-east-1 }
+      - uses: hashicorp/setup-terraform@v3
+        with: { terraform_version: "${{ env.TF_VERSION }}" }
+      - working-directory: terraform
+        run: |
+          terraform init -input=false -backend-config=envs/dev.backend.hcl
+          terraform plan  -input=false -lock-timeout=5m -var-file=envs/dev.tfvars -out=tfplan
+          terraform apply -input=false tfplan
+
+  apply-prod:
+    needs: apply-dev          # promote only after dev succeeded
+    runs-on: ubuntu-latest
+    environment: prod         # configure required reviewers on this GitHub Environment = manual approval
+    concurrency: { group: tf-prod, cancel-in-progress: false }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with: { role-to-arn: "${{ vars.AWS_APPLY_ROLE_ARN }}", aws-region: us-east-1 }
+      - uses: hashicorp/setup-terraform@v3
+        with: { terraform_version: "${{ env.TF_VERSION }}" }
+      - working-directory: terraform
+        run: |
+          terraform init -input=false -backend-config=envs/prod.backend.hcl
+          terraform plan  -input=false -lock-timeout=5m -var-file=envs/prod.tfvars -out=tfplan
+          terraform apply -input=false tfplan

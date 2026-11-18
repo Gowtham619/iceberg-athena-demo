@@ -1,0 +1,14 @@
+repos:
+  - repo: https://github.com/antonbabenko/pre-commit-terraform
+    rev: v1.96.2
+    hooks:
+      - id: terraform_fmt
+      - id: terraform_validate
+      - id: terraform_tflint
+  - repo: local
+    hooks:
+      - id: pytest
+        name: unit tests
+        entry: python -m pytest -q tests
+        language: system
+        pass_filenames: false

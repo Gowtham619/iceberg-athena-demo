@@ -1,0 +1,27 @@
+# One file = one daily pipeline. Add a file + `terraform apply` for a new table.
+# {{dt}} = load date (default: yesterday UTC). ${db} is filled in by Terraform.
+# The MERGE must be idempotent (re-running a date is safe) and a SINGLE statement.
+target_table: ${db}.orders_iceberg
+
+source:
+  table: ${db}.raw_orders_daily
+  partition_column: dt
+  s3_prefix: raw/orders_daily/dt={{dt}}/
+  ready_marker: _SUCCESS      # upstream writes this LAST; its arrival (S3 event) starts the load. Must equal var.ready_marker_name
+
+checks:                        # data-quality gate on the source partition, run BEFORE the MERGE
+  min_rows: 1
+  key_columns: [order_id]      # duplicate keys would make MERGE fail / be non-deterministic
+  not_null: [order_id, order_date]
+
+merge_sql: |
+  MERGE INTO ${db}.orders_iceberg t
+  USING (
+    SELECT order_id, customer_id, CAST(order_date AS date) AS order_date, status, amount
+    FROM ${db}.raw_orders_daily
+    WHERE dt = '{{dt}}'
+  ) s
+  ON t.order_id = s.order_id
+  WHEN MATCHED THEN UPDATE SET status = s.status, amount = s.amount
+  WHEN NOT MATCHED THEN INSERT (order_id, customer_id, order_date, status, amount)
+    VALUES (s.order_id, s.customer_id, s.order_date, s.status, s.amount)

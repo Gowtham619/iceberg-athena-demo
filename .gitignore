@@ -1,0 +1,14 @@
+.terraform/
+*.tfstate*
+.build/
+tfplan
+plan.txt
+terraform.tfvars
+__pycache__/
+.pytest_cache/
+*.zip
+.venv/
+venv/
+.DS_Store
+*.csv
+.terraform.lock.hcl.bak
